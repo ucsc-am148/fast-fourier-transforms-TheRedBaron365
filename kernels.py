@@ -219,16 +219,19 @@ def f2_kernel(
         v_partner_re = tl.gather(v_re, partner, axis=0)
         v_partner_im = tl.gather(v_im, partner, axis=0)
 
-        # tw * v_partner (lower butterfly: new = v + tw * v_partner)
-        twvp_re = tw_re_val * v_partner_re - tw_im_val * v_partner_im
-        twvp_im = tw_re_val * v_partner_im + tw_im_val * v_partner_re
-        # tw * v_self (upper butterfly: new = v_partner - tw * v)
-        twvs_re = tw_re_val * v_re - tw_im_val * v_im
-        twvs_im = tw_re_val * v_im + tw_im_val * v_re
-
         is_lower = (idx & half) == 0
-        v_re = tl.where(is_lower, v_re + twvp_re, v_partner_re - twvs_re)
-        v_im = tl.where(is_lower, v_im + twvp_im, v_partner_im - twvs_im)
+        # each lane only ends up using one of the two products, so pick the
+        # operand first and do a single cmul -- the other one was wasted work.
+        # lower: v + tw*partner, upper: partner - tw*v.
+        mul_re = tl.where(is_lower, v_partner_re, v_re)
+        mul_im = tl.where(is_lower, v_partner_im, v_im)
+        prod_re = tw_re_val * mul_re - tw_im_val * mul_im
+        prod_im = tw_re_val * mul_im + tw_im_val * mul_re
+
+        add_re = tl.where(is_lower, v_re, v_partner_re)
+        add_im = tl.where(is_lower, v_im, v_partner_im)
+        v_re = tl.where(is_lower, add_re + prod_re, add_re - prod_re)
+        v_im = tl.where(is_lower, add_im + prod_im, add_im - prod_im)
 
     # Optional Bailey epilogue (F2-A in F3): multiply by bt[n1, k2]
     if BAILEY_EPILOGUE:
@@ -252,6 +255,17 @@ def f2_kernel(
         tl.store(y_im_ptr + pid * N + idx, v_im)
 
 
+def _f2_num_warps(N):
+    # the whole length-N signal lives in one program's registers, so at the
+    # default 4 warps it starts spilling once N gets past ~8k -- saw ~14x
+    # slower at 8192. more warps spreads it over more threads; aim for roughly
+    # 32 elems/thread, i.e. N/1024 warps, capped at 32. just a launch knob,
+    # the output is the same either way.
+    nw = max(1, N // 1024)
+    nw = 1 << (nw - 1).bit_length() if nw & (nw - 1) else nw  # round up to pow2
+    return max(4, min(32, nw))
+
+
 def f2_launch(x_re, x_im, y_re, y_im, tw_re, tw_im, perm):
     """Grid: (B,). One program per length-N signal. Vanilla mode.
 
@@ -266,6 +280,7 @@ def f2_launch(x_re, x_im, y_re, y_im, tw_re, tw_im, perm):
         1, 0,          # OUTER_DIM, N_TOTAL unused
         N=N, LOG2_N=LOG2_N,
         BAILEY_EPILOGUE=False, STRIDED_STORE=False,
+        num_warps=_f2_num_warps(N), num_stages=1,
     )
 
 
